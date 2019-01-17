@@ -299,7 +299,8 @@ func (p *cassandra_cql_Parser) report(req, resp *cassandra_cql_frame) {
 	if req.opcode == cmd_QUERY || req.opcode == cmd_EXECUTE {
 		var buf strings.Builder
 
-		buf.WriteString(fmt.Sprintf("{\"cql\": \"%s\", \"args\": [", *cql))
+		now := time.Now().UnixNano()
+		buf.WriteString(fmt.Sprintf("{\"unixnanos\": %d, \"cql\": \"%s\", \"args\": [", now, *cql))
 
 		if *debug_cql_req {
 			fmt.Printf("proto version: %d\n", int(req.version))
