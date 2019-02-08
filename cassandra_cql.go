@@ -7,8 +7,10 @@ import (
 	"log"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/golang/protobuf/proto"
 	"github.com/golang/snappy"
 )
 
@@ -244,9 +246,30 @@ func read_longstring(data []byte) (out string, ok bool) {
 	return string(bytes), true
 }
 
-var DEFAULT_CQL string = "unknown cql"
+var DEFAULT_CQL string = "cql_unknown"
 
-var debug_cql_req = flag.Bool("debug_cql_req", false, "Debug cassandra cql request reassembly")
+var (
+	capture_cql_file = flag.String("capture_cql_file", "", "Capture cassandra cql traffic and encode to file")
+	debug_cql_req    = flag.Bool("debug_cql_req", false, "Debug cassandra cql request reassembly")
+	captureFile      = &struct {
+		sync.Mutex
+		fd *os.File
+	}{}
+)
+
+var protoBufPool = sync.Pool{
+	New: func() interface{} {
+		return proto.NewBuffer(nil)
+	},
+}
+
+func getProtoBuf() *proto.Buffer {
+	return protoBufPool.Get().(*proto.Buffer)
+}
+
+func putProtoBuf(b *proto.Buffer) {
+	protoBufPool.Put(b)
+}
 
 func (p *cassandra_cql_Parser) report(req, resp *cassandra_cql_frame) {
 	var (
@@ -297,10 +320,11 @@ func (p *cassandra_cql_Parser) report(req, resp *cassandra_cql_frame) {
 	}
 
 	if req.opcode == cmd_QUERY || req.opcode == cmd_EXECUTE {
-		var buf strings.Builder
-
-		now := time.Now().UnixNano()
-		buf.WriteString(fmt.Sprintf("{\"unixnanos\": %d, \"cql\": \"%s\", \"args\": [", now, *cql))
+		query := CassandraQuery{
+			Version:    0,
+			ReceivedAt: time.Now(),
+			CQL:        *cql,
+		}
 
 		if *debug_cql_req {
 			fmt.Printf("proto version: %d\n", int(req.version))
@@ -388,10 +412,10 @@ func (p *cassandra_cql_Parser) report(req, resp *cassandra_cql_frame) {
 			switch {
 			case numBytes == -1:
 				// nil
-				buf.WriteString("null")
+				query.Args = append(query.Args, []byte(nil))
 			case numBytes == -2:
 				// unset
-				buf.WriteString("null")
+				query.Args = append(query.Args, []byte(nil))
 			case numBytes >= 0:
 				var bytes []byte
 				payload, bytes, err = readBytes(payload, int(numBytes))
@@ -403,17 +427,26 @@ func (p *cassandra_cql_Parser) report(req, resp *cassandra_cql_frame) {
 					fmt.Printf("arg %d value: %x\n", i, bytes)
 				}
 
-				buf.WriteString(fmt.Sprintf("\"%x\"", bytes))
-			}
-
-			if i != int(args)-1 {
-				buf.WriteString(", ")
+				query.Args = append(query.Args, bytes)
 			}
 		}
 
-		buf.WriteString("]}\n")
+		buf := getProtoBuf()
+		defer putProtoBuf(buf)
 
-		os.Stdout.WriteString(buf.String())
+		err := query.Encode(buf)
+		if err != nil {
+			fmt.Printf("encode query error: %v\n", err)
+			return
+		}
+
+		captureFile.Lock()
+		if fd := captureFile.fd; fd != nil {
+			if _, err := fd.Write(buf.Bytes()); err != nil {
+				fmt.Printf("write capture error: %v\n", err)
+			}
+		}
+		captureFile.Unlock()
 	}
 
 	duration := resp.timestamp.Sub(req.timestamp)
@@ -565,4 +598,83 @@ func init() {
 	cassProt := &TCPProtocol{name: "cassandra_cql", defaultPort: 9042}
 	cassProt.interpFactory = factory
 	RegisterTCPProtocol(cassProt)
+
+	if f := *capture_cql_file; f != "" {
+		fd, err := os.Create(f)
+		if err != nil {
+			log.Printf("failed to open capture file: file=%s, err=%v\n", f, err)
+			return
+		}
+		captureFile.Lock()
+		captureFile.fd = fd
+		captureFile.Unlock()
+	}
+}
+
+type CassandraQuery struct {
+	Version    uint64
+	ReceivedAt time.Time
+	CQL        string
+	Args       [][]byte
+}
+
+func (f *CassandraQuery) Encode(buf *proto.Buffer) error {
+	if err := buf.EncodeFixed32(f.Version); err != nil {
+		return err
+	}
+
+	if err := buf.EncodeFixed64(uint64(f.ReceivedAt.UnixNano())); err != nil {
+		return err
+	}
+
+	if err := buf.EncodeStringBytes(f.CQL); err != nil {
+		return err
+	}
+
+	if err := buf.EncodeFixed32(uint64(len(f.Args))); err != nil {
+		return err
+	}
+
+	for _, arg := range f.Args {
+		if err := buf.EncodeRawBytes(arg); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (f *CassandraQuery) Decode(buf *proto.Buffer) error {
+	var err error
+	f.Version, err = buf.DecodeFixed32()
+	if err != nil {
+		return err
+	}
+
+	receivedAt, err := buf.DecodeFixed64()
+	if err != nil {
+		return err
+	}
+
+	f.ReceivedAt = time.Unix(0, int64(receivedAt))
+
+	f.CQL, err = buf.DecodeStringBytes()
+	if err != nil {
+		return err
+	}
+
+	n, err := buf.DecodeFixed32()
+	if err != nil {
+		return err
+	}
+
+	for i := uint64(0); i < n; i++ {
+		arg, err := buf.DecodeRawBytes(true)
+		if err != nil {
+			return err
+		}
+		f.Args = append(f.Args, arg)
+	}
+
+	return nil
 }
