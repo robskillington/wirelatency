@@ -260,7 +260,9 @@ var protoBufPool = sync.Pool{
 }
 
 func getProtoBuf() *proto.Buffer {
-	return protoBufPool.Get().(*proto.Buffer)
+	buf := protoBufPool.Get().(*proto.Buffer)
+	buf.Reset()
+	return buf
 }
 
 func putProtoBuf(b *proto.Buffer) {
