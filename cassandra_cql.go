@@ -14,11 +14,8 @@ import (
 	"github.com/golang/snappy"
 )
 
-const (
-	DEFAULT_CQL = "cql_unknown"
-)
-
 var (
+	DEFAULT_CQL      = "cql_unknown"
 	debug_cql        = flag.Bool("debug_cql", false, "Debug cassandra cql reassembly")
 	debug_cql_req    = flag.Bool("debug_cql_req", false, "Debug cassandra cql request reassembly")
 	capture_cql_file = flag.String("capture_cql_file", "", "Capture cassandra cql traffic and encode to file")
