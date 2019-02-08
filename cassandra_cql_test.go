@@ -33,8 +33,8 @@ func TestCassandraQuery(t *testing.T) {
 
 		bytes := buf.Bytes()
 
-		binary.LittleEndian.PutUint32(lengthBuf[:], uint32(len(bytes)))
-		if _, err := output.Write(lengthBuf[:]); err != nil {
+		binary.LittleEndian.PutUint32(lengthBuf, uint32(len(bytes)))
+		if _, err := output.Write(lengthBuf); err != nil {
 			t.Fatalf("failed to write output size: %v", err)
 		}
 
@@ -50,12 +50,12 @@ func TestCassandraQuery(t *testing.T) {
 		d := &CassandraQuery{}
 
 		// Read the size of the message
-		_, err := io.ReadFull(reader, lengthBuf[:])
+		_, err := io.ReadFull(reader, lengthBuf)
 		if err != nil {
 			t.Fatalf("failed to read length: %v", err)
 		}
 
-		size := binary.LittleEndian.Uint32(lengthBuf[:])
+		size := binary.LittleEndian.Uint32(lengthBuf)
 		if cap(reuseableBuf) < int(size) {
 			reuseableBuf = make([]byte, size)
 		} else {
