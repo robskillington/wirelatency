@@ -599,16 +599,21 @@ func init() {
 	cassProt.interpFactory = factory
 	RegisterTCPProtocol(cassProt)
 
-	if f := *capture_cql_file; f != "" {
-		fd, err := os.Create(f)
-		if err != nil {
-			log.Printf("failed to open capture file: file=%s, err=%v\n", f, err)
-			return
-		}
-		captureFile.Lock()
-		captureFile.fd = fd
-		captureFile.Unlock()
+	f := *capture_cql_file
+	if f == "" {
+		log.Println("no capture file specified")
+		return
 	}
+
+	log.Println("opening capture file: %v\n", f)
+	fd, err := os.Create(f)
+	if err != nil {
+		log.Printf("failed to open capture file: file=%s, err=%v\n", f, err)
+		return
+	}
+	captureFile.Lock()
+	captureFile.fd = fd
+	captureFile.Unlock()
 }
 
 type CassandraQuery struct {
