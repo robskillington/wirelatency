@@ -14,7 +14,20 @@ import (
 	"github.com/golang/snappy"
 )
 
-var debug_cql = flag.Bool("debug_cql", false, "Debug cassandra cql reassembly")
+const (
+	DEFAULT_CQL = "cql_unknown"
+)
+
+var (
+	debug_cql        = flag.Bool("debug_cql", false, "Debug cassandra cql reassembly")
+	debug_cql_req    = flag.Bool("debug_cql_req", false, "Debug cassandra cql request reassembly")
+	capture_cql_file = flag.String("capture_cql_file", "", "Capture cassandra cql traffic and encode to file")
+
+	captureFile = &struct {
+		sync.Mutex
+		fd *os.File
+	}{}
+)
 
 const (
 	retainedPayloadSize int = 512
@@ -245,17 +258,6 @@ func read_longstring(data []byte) (out string, ok bool) {
 
 	return string(bytes), true
 }
-
-var DEFAULT_CQL string = "cql_unknown"
-
-var (
-	capture_cql_file = flag.String("capture_cql_file", "", "Capture cassandra cql traffic and encode to file")
-	debug_cql_req    = flag.Bool("debug_cql_req", false, "Debug cassandra cql request reassembly")
-	captureFile      = &struct {
-		sync.Mutex
-		fd *os.File
-	}{}
-)
 
 var protoBufPool = sync.Pool{
 	New: func() interface{} {
