@@ -438,8 +438,14 @@ func (p *cassandra_cql_Parser) report(req, resp *cassandra_cql_frame) {
 			return
 		}
 
+		var size [4]byte
+		binary.LittleEndian.PutUint32(size[:], uint32(len(buf.Bytes())))
+
 		capture.Lock()
 		if fd, ok := capture.FD(); ok {
+			if _, err := fd.Write(size[:]); err != nil {
+				fmt.Printf("write capture error: %v\n", err)
+			}
 			if _, err := fd.Write(buf.Bytes()); err != nil {
 				fmt.Printf("write capture error: %v\n", err)
 			}
@@ -618,7 +624,7 @@ func (f *captureFile) FD() (*os.File, bool) {
 	if err != nil {
 		if !f.errLog {
 			f.errLog = true
-			log.Printf("failed to open capture file: file=%s, err=%v\n", f, err)
+			log.Printf("failed to open capture file: file=%s, err=%v\n", file, err)
 		}
 		return nil, false
 	}
@@ -628,6 +634,8 @@ func (f *captureFile) FD() (*os.File, bool) {
 }
 
 type CassandraQuery struct {
+	internalBuf proto.Buffer
+
 	Version    uint64
 	ReceivedAt time.Time
 	CQL        string
