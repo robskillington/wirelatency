@@ -20,10 +20,7 @@ var (
 	debug_cql_req    = flag.Bool("debug_cql_req", false, "Debug cassandra cql request reassembly")
 	capture_cql_file = flag.String("capture_cql_file", "", "Capture cassandra cql traffic and encode to file")
 
-	captureFile = &struct {
-		sync.Mutex
-		fd *os.File
-	}{}
+	capture = &captureFile{}
 )
 
 const (
@@ -439,13 +436,13 @@ func (p *cassandra_cql_Parser) report(req, resp *cassandra_cql_frame) {
 			return
 		}
 
-		captureFile.Lock()
-		if fd := captureFile.fd; fd != nil {
+		capture.Lock()
+		if fd, ok := capture.FD(); ok {
 			if _, err := fd.Write(buf.Bytes()); err != nil {
 				fmt.Printf("write capture error: %v\n", err)
 			}
 		}
-		captureFile.Unlock()
+		capture.Unlock()
 	}
 
 	duration := resp.timestamp.Sub(req.timestamp)
@@ -597,22 +594,35 @@ func init() {
 	cassProt := &TCPProtocol{name: "cassandra_cql", defaultPort: 9042}
 	cassProt.interpFactory = factory
 	RegisterTCPProtocol(cassProt)
+}
 
-	f := *capture_cql_file
-	if f == "" {
-		log.Println("no capture file specified")
-		return
+type captureFile struct {
+	sync.Mutex
+	fd     *os.File
+	errLog bool
+}
+
+func (f *captureFile) FD() (*os.File, bool) {
+	file := *capture_cql_file
+	if file == "" {
+		return nil, false // no capture file
 	}
 
-	log.Println("opening capture file: %v\n", f)
-	fd, err := os.Create(f)
+	if f.fd != nil {
+		return f.fd, true
+	}
+
+	fd, err := os.Create(file)
 	if err != nil {
-		log.Printf("failed to open capture file: file=%s, err=%v\n", f, err)
-		return
+		if !f.errLog {
+			f.errLog = true
+			log.Printf("failed to open capture file: file=%s, err=%v\n", f, err)
+		}
+		return nil, false
 	}
-	captureFile.Lock()
-	captureFile.fd = fd
-	captureFile.Unlock()
+
+	f.fd = fd
+	return fd, true
 }
 
 type CassandraQuery struct {
