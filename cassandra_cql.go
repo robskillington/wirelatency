@@ -429,21 +429,19 @@ func (p *cassandra_cql_Parser) report(req, resp *cassandra_cql_frame) {
 			}
 		}
 
-		buf := getProtoBuf()
-		defer putProtoBuf(buf)
-
+		buf := proto.NewBuffer(nil)
 		err := query.Encode(buf)
 		if err != nil {
 			fmt.Printf("encode query error: %v\n", err)
 			return
 		}
 
-		var size [4]byte
-		binary.LittleEndian.PutUint32(size[:], uint32(len(buf.Bytes())))
+		size := make([]byte, 4)
+		binary.LittleEndian.PutUint32(size, uint32(len(buf.Bytes())))
 
 		capture.Lock()
 		if fd, ok := capture.FD(); ok {
-			if _, err := fd.Write(size[:]); err != nil {
+			if _, err := fd.Write(size); err != nil {
 				fmt.Printf("write capture error: %v\n", err)
 			}
 			if _, err := fd.Write(buf.Bytes()); err != nil {
@@ -634,8 +632,6 @@ func (f *captureFile) FD() (*os.File, bool) {
 }
 
 type CassandraQuery struct {
-	internalBuf proto.Buffer
-
 	Version    uint64
 	ReceivedAt time.Time
 	CQL        string
