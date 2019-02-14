@@ -3,13 +3,25 @@ package wirelatency
 import (
 	"encoding/binary"
 	"flag"
-	"github.com/golang/snappy"
+	"fmt"
 	"log"
+	"os"
 	"strings"
+	"sync"
 	"time"
+
+	"github.com/golang/protobuf/proto"
+	"github.com/golang/snappy"
 )
 
-var debug_cql = flag.Bool("debug_cql", false, "Debug cassandra cql reassembly")
+var (
+	DEFAULT_CQL      = "cql_unknown"
+	debug_cql        = flag.Bool("debug_cql", false, "Debug cassandra cql reassembly")
+	debug_cql_req    = flag.Bool("debug_cql_req", false, "Debug cassandra cql request reassembly")
+	capture_cql_file = flag.String("capture_cql_file", "", "Capture cassandra cql traffic and encode to file")
+
+	capture = &captureFile{}
+)
 
 const (
 	retainedPayloadSize int = 512
@@ -223,43 +235,222 @@ func (p *cassandra_cql_Parser) popFromStream(stream int16) (f *cassandra_cql_fra
 }
 
 func read_longstring(data []byte) (out string, ok bool) {
-	if len(data) < 4 {
+	var (
+		v   int32
+		err error
+	)
+	data, v, err = readInt(data)
+	if err != nil {
 		return "", false
 	}
-	strlen := binary.BigEndian.Uint32(data)
-	if len(data) < (4 + int(strlen)) {
+
+	var bytes []byte
+	_, bytes, err = readBytes(data, int(v))
+	if err != nil {
 		return "", false
 	}
-	return string(data[4 : strlen+4]), true
+
+	return string(bytes), true
 }
 
-var DEFAULT_CQL string = "unknown cql"
+var protoBufPool = sync.Pool{
+	New: func() interface{} {
+		return proto.NewBuffer(nil)
+	},
+}
+
+func getProtoBuf() *proto.Buffer {
+	buf := protoBufPool.Get().(*proto.Buffer)
+	buf.Reset()
+	return buf
+}
+
+func putProtoBuf(b *proto.Buffer) {
+	protoBufPool.Put(b)
+}
 
 func (p *cassandra_cql_Parser) report(req, resp *cassandra_cql_frame) {
-	var cql *string
+	var (
+		cql  *string
+		data []byte
+		err  error
+	)
 	cql = &DEFAULT_CQL
+	data = req.data
 	if req.opcode == cmd_QUERY && req.data != nil {
 		if qcql, ok := read_longstring(req.data); ok {
 			cql = &qcql
+			data = data[4+len(qcql):]
 		}
 	}
 	if req.opcode == cmd_PREPARE && req.data != nil {
 		if qcql, ok := read_longstring(req.data); ok {
+			data = data[4+len(qcql):]
 			if resp.data != nil && len(resp.data) >= 2 {
 				qcql = strings.Replace(qcql, "\n", " ", -1)
 				qcql = strings.Replace(qcql, "\r", " ", -1)
 				cql = &qcql
-				p.factory.parsed[binary.BigEndian.Uint16(resp.data)] = *cql
+
+				var id []byte
+				resp.data, id, err = readShortBytes(resp.data)
+				if err != nil {
+					fmt.Printf("read prepared id err: %v\n", err)
+					return
+				}
+
+				p.factory.parsed[string(id)] = *cql
 			}
 		}
 	}
 	if req.opcode == cmd_EXECUTE && req.data != nil && len(req.data) >= 2 {
-		id := binary.BigEndian.Uint16(req.data)
-		if prepared_cql, ok := p.factory.parsed[id]; ok {
+		var id []byte
+		data, id, err = readShortBytes(req.data)
+		if err != nil {
+			fmt.Printf("read execute id err: %v\n", err)
+			return
+		}
+
+		if prepared_cql, ok := p.factory.parsed[string(id)]; ok {
 			cql = &prepared_cql
 		} else {
 			cql = &DEFAULT_CQL
 		}
+	}
+
+	if req.opcode == cmd_QUERY || req.opcode == cmd_EXECUTE {
+		query := CassandraQuery{
+			Version:    0,
+			ReceivedAt: time.Now(),
+			CQL:        *cql,
+		}
+
+		if *debug_cql_req {
+			fmt.Printf("proto version: %d\n", int(req.version))
+		}
+
+		payload := data
+
+		// read consistency
+		var consistency uint16
+		payload, consistency, err = readShort(payload)
+		if err != nil {
+			fmt.Printf("read consistency err: %v\n", err)
+			return
+		}
+
+		if *debug_cql_req {
+			switch consistency {
+			case 0x00:
+				fmt.Printf("consistency: Any\n")
+			case 0x01:
+				fmt.Printf("consistency: One\n")
+			case 0x02:
+				fmt.Printf("consistency: Two\n")
+			case 0x03:
+				fmt.Printf("consistency: Three\n")
+			case 0x04:
+				fmt.Printf("consistency: Quorum\n")
+			case 0x05:
+				fmt.Printf("consistency: All\n")
+			case 0x06:
+				fmt.Printf("consistency: LocalQuorum\n")
+			case 0x07:
+				fmt.Printf("consistency: EachQuorum\n")
+			case 0x0A:
+				fmt.Printf("consistency: LocalOne\n")
+			default:
+				fmt.Printf("consistency: UNKNOWN\n")
+			}
+		}
+
+		// read flags
+		if req.version > 4 {
+			var flags uint32
+			payload, flags, err = readUint(payload)
+			if *debug_cql_req {
+				fmt.Printf("flags: %x\n", flags)
+			}
+		} else {
+			var flags byte
+			payload, flags, err = readByte(payload)
+			if *debug_cql_req {
+				fmt.Printf("flags: %x\n", flags)
+			}
+		}
+		if err != nil {
+			fmt.Printf("read flags err: %v\n", err)
+			return
+		}
+
+		// read num args
+		var args uint16
+		payload, args, err = readShort(payload)
+		if err != nil {
+			fmt.Printf("read num args err: %v\n", err)
+			return
+		}
+
+		if *debug_cql_req {
+			fmt.Printf("num args: %d\n", args)
+		}
+
+		// read args
+		for i := 0; i < int(args); i++ {
+			var numBytes int32
+			payload, numBytes, err = readInt(payload)
+			if err != nil {
+				fmt.Printf("read arg %d length err: %v\n", i, err)
+				return
+			}
+
+			if *debug_cql_req {
+				fmt.Printf("arg %d length: %d\n", i, numBytes)
+			}
+
+			switch {
+			case numBytes == -1:
+				// nil
+				query.Args = append(query.Args, []byte(nil))
+			case numBytes == -2:
+				// unset
+				query.Args = append(query.Args, []byte(nil))
+			case numBytes >= 0:
+				var bytes []byte
+				payload, bytes, err = readBytes(payload, int(numBytes))
+				if err != nil {
+					fmt.Printf("read arg %d value err: %v\n", i, err)
+					return
+				}
+				if *debug_cql_req {
+					fmt.Printf("arg %d value: %x\n", i, bytes)
+				}
+
+				query.Args = append(query.Args, bytes)
+			}
+		}
+
+		buf := getProtoBuf()
+		defer putProtoBuf(buf)
+
+		err := query.Encode(buf)
+		if err != nil {
+			fmt.Printf("encode query error: %v\n", err)
+			return
+		}
+
+		var size [4]byte
+		binary.LittleEndian.PutUint32(size[:], uint32(len(buf.Bytes())))
+
+		capture.Lock()
+		if fd, ok := capture.FD(); ok {
+			if _, err := fd.Write(size[:]); err != nil {
+				fmt.Printf("write capture error: %v\n", err)
+			}
+			if _, err := fd.Write(buf.Bytes()); err != nil {
+				fmt.Printf("write capture error: %v\n", err)
+			}
+		}
+		capture.Unlock()
 	}
 
 	duration := resp.timestamp.Sub(req.timestamp)
@@ -278,6 +469,59 @@ func (p *cassandra_cql_Parser) report(req, resp *cassandra_cql_frame) {
 		wl_track_float64("seconds", float64(duration)/1000000000.0, execName+"`latency")
 	}
 }
+
+var endianness = binary.BigEndian
+
+func readByte(b []byte) ([]byte, byte, error) {
+	if len(b) < 1 {
+		return nil, 0, fmt.Errorf("readByte: no next byte")
+	}
+	return b[1:], b[0], nil
+}
+
+func readShort(b []byte) ([]byte, uint16, error) {
+	if len(b) < 2 {
+		return nil, 0, fmt.Errorf("readShort: no next two bytes")
+	}
+	v := endianness.Uint16(b[:2])
+	return b[2:], v, nil
+}
+
+func readUint(b []byte) ([]byte, uint32, error) {
+	if len(b) < 4 {
+		return nil, 0, fmt.Errorf("readUint: no next four bytes")
+	}
+	v := endianness.Uint32(b[:4])
+	return b[4:], v, nil
+}
+
+func readInt(p []byte) ([]byte, int32, error) {
+	if len(p) < 4 {
+		return nil, 0, fmt.Errorf("readInt: no next four bytes")
+	}
+	v := int32(p[0])<<24 | int32(p[1])<<16 | int32(p[2])<<8 | int32(p[3])
+	return p[4:], v, nil
+}
+
+func readBytes(b []byte, n int) (payload []byte, bytes []byte, err error) {
+	if len(b) < n {
+		return nil, nil, fmt.Errorf("readBytes: expecting %d bytes but only %d", n, len(b))
+	}
+	payload = b[n:]
+	bytes = b[:n]
+	return
+}
+
+func readShortBytes(b []byte) (payload []byte, bytes []byte, err error) {
+	var n uint16
+	b, n, err = readShort(b)
+	if err != nil {
+		return nil, nil, fmt.Errorf("readBytes: readShort failed: %v", err)
+	}
+
+	return readBytes(b, int(n))
+}
+
 func (p *cassandra_cql_Parser) InBytes(stream *tcpTwoWayStream, seen time.Time, data []byte) bool {
 	// build a request
 	for {
@@ -341,7 +585,7 @@ func (p *cassandra_cql_Parser) ManageOut(stream *tcpTwoWayStream) {
 }
 
 type cassandra_cql_ParserFactory struct {
-	parsed map[uint16]string
+	parsed map[string]string
 }
 
 func (f *cassandra_cql_ParserFactory) New() TCPProtocolInterpreter {
@@ -354,8 +598,105 @@ func (f *cassandra_cql_ParserFactory) New() TCPProtocolInterpreter {
 }
 func init() {
 	factory := &cassandra_cql_ParserFactory{}
-	factory.parsed = make(map[uint16]string)
+	factory.parsed = make(map[string]string)
 	cassProt := &TCPProtocol{name: "cassandra_cql", defaultPort: 9042}
 	cassProt.interpFactory = factory
 	RegisterTCPProtocol(cassProt)
+}
+
+type captureFile struct {
+	sync.Mutex
+	fd     *os.File
+	errLog bool
+}
+
+func (f *captureFile) FD() (*os.File, bool) {
+	file := *capture_cql_file
+	if file == "" {
+		return nil, false // no capture file
+	}
+
+	if f.fd != nil {
+		return f.fd, true
+	}
+
+	fd, err := os.Create(file)
+	if err != nil {
+		if !f.errLog {
+			f.errLog = true
+			log.Printf("failed to open capture file: file=%s, err=%v\n", file, err)
+		}
+		return nil, false
+	}
+
+	f.fd = fd
+	return fd, true
+}
+
+type CassandraQuery struct {
+	Version    uint64
+	ReceivedAt time.Time
+	CQL        string
+	Args       [][]byte
+}
+
+func (f *CassandraQuery) Encode(buf *proto.Buffer) error {
+	if err := buf.EncodeFixed32(f.Version); err != nil {
+		return err
+	}
+
+	if err := buf.EncodeFixed64(uint64(f.ReceivedAt.UnixNano())); err != nil {
+		return err
+	}
+
+	if err := buf.EncodeStringBytes(f.CQL); err != nil {
+		return err
+	}
+
+	if err := buf.EncodeFixed32(uint64(len(f.Args))); err != nil {
+		return err
+	}
+
+	for _, arg := range f.Args {
+		if err := buf.EncodeRawBytes(arg); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (f *CassandraQuery) Decode(buf *proto.Buffer) error {
+	var err error
+	f.Version, err = buf.DecodeFixed32()
+	if err != nil {
+		return err
+	}
+
+	receivedAt, err := buf.DecodeFixed64()
+	if err != nil {
+		return err
+	}
+
+	f.ReceivedAt = time.Unix(0, int64(receivedAt))
+
+	f.CQL, err = buf.DecodeStringBytes()
+	if err != nil {
+		return err
+	}
+
+	n, err := buf.DecodeFixed32()
+	if err != nil {
+		return err
+	}
+
+	for i := uint64(0); i < n; i++ {
+		arg, err := buf.DecodeRawBytes(true)
+		if err != nil {
+			return err
+		}
+		f.Args = append(f.Args, arg)
+	}
+
+	return nil
 }
